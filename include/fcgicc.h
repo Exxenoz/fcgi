@@ -77,8 +77,10 @@ public:
         set_handler(handle_complete, new Handler<C>(object, function));
     }
 
-    void listen(unsigned tcp_port);
+    void listen(unsigned int tcp_port);
+#ifndef WIN32
     void listen(const std::string& local_path);
+#endif
     void abandon_files();
 
     void process(int timeout_ms = -1); // timeout_ms<0 blocks forever
@@ -127,6 +129,7 @@ protected:
 
 
     struct HandlerBase {
+        virtual ~HandlerBase() {}
         virtual int operator()(FastCGIRequest&);
     };
 

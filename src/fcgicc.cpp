@@ -34,19 +34,30 @@
 
 #include "fcgicc.h"
 
-#include <cstring> // bzero, memcpy
+#include <cstring> // memset, memcpy
 #include <stdexcept>
 
 #include <errno.h> // E*
+
+#ifdef WIN32
+#include <io.h>
+#include <WinSock2.h>
+#include <minwindef.h>
+#else
 #include <unistd.h> // read, write, close, unlink
 #include <arpa/inet.h> // hton*
 #include <netinet/in.h> // sockaddr_in, INADDR_*
 #include <sys/select.h> // select, fd_set, FD_*, timeval
 #include <sys/socket.h> // socket, bind, accept, listen, sockaddr, AF_*, SOCK_*
 #include <sys/un.h> // sockaddr_un
+#endif
 
 #include <fastcgi.h>
 
+#ifndef WIN32
+#define min std::min
+#define max std::max
+#endif
 
 FastCGIServer::RequestInfo::RequestInfo() :
     params_closed(false),
@@ -70,12 +81,22 @@ FastCGIServer::HandlerBase::operator()(FastCGIRequest&)
     return 0;
 }
 
+#ifdef WIN32
+WSADATA wsaData;
+#endif
 
 FastCGIServer::FastCGIServer() :
     handle_request(new HandlerBase),
     handle_data(new HandlerBase),
     handle_complete(new HandlerBase)
 {
+#ifdef WIN32
+    int err = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (err != 0)
+    {
+        throw std::runtime_error("WSAStartup() failed");
+    }
+#endif
 }
 
 
@@ -101,6 +122,10 @@ FastCGIServer::~FastCGIServer()
     delete handle_request;
     delete handle_data;
     delete handle_complete;
+
+#ifdef WIN32
+    WSACleanup();
+#endif
 }
 
 
@@ -134,7 +159,7 @@ FastCGIServer::set_handler(HandlerBase*& handler, HandlerBase* new_handler)
 
 
 void
-FastCGIServer::listen(unsigned tcp_port)
+FastCGIServer::listen(unsigned int tcp_port)
 {
     int listen_socket = socket(PF_INET, SOCK_STREAM, 0);
     if (listen_socket == -1)
@@ -142,7 +167,7 @@ FastCGIServer::listen(unsigned tcp_port)
 
     try {
         struct sockaddr_in sa;
-        bzero(&sa, sizeof(sa));
+		memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
         sa.sin_port = htons(tcp_port);
         sa.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -160,7 +185,7 @@ FastCGIServer::listen(unsigned tcp_port)
     }
 }
 
-
+#ifndef WIN32
 void
 FastCGIServer::listen(const std::string& local_path)
 {
@@ -170,7 +195,7 @@ FastCGIServer::listen(const std::string& local_path)
 
     try {
         struct sockaddr_un sa;
-        bzero(&sa, sizeof(sa));
+        memset(&sa, 0, sizeof(sa));
         sa.sun_family = AF_LOCAL;
 
         std::string::size_type size = local_path.size();
@@ -203,7 +228,7 @@ FastCGIServer::listen(const std::string& local_path)
         throw;
     }
 }
-
+#endif
 
 void
 FastCGIServer::abandon_files()
@@ -227,7 +252,7 @@ FastCGIServer::process(int timeout_ms)
     for (std::vector<int>::const_iterator it = listen_sockets.begin();
             it != listen_sockets.end(); ++it) {
         FD_SET(*it, &fs_read);
-        nfd = std::max(nfd, *it);
+        nfd = max(nfd, *it);
     }
 
     for (std::map<int, Connection*>::const_iterator it = read_sockets.begin();
@@ -235,16 +260,18 @@ FastCGIServer::process(int timeout_ms)
         FD_SET(it->first, &fs_read);
         if (!it->second->output_buffer.empty())
             FD_SET(it->first, &fs_write);
-        nfd = std::max(nfd, it->first);
+        nfd = max(nfd, it->first);
     }
 
     int select_result = select(nfd + 1, &fs_read, &fs_write, NULL,
         timeout_ms < 0 ? NULL : &tv);
     if (select_result == -1)
+    {
         if (errno == EINTR)
             return;
         else
             throw std::runtime_error("select() failed");
+    }
 
     for (std::vector<int>::const_iterator it = listen_sockets.begin();
             it != listen_sockets.end(); ++it)
@@ -267,12 +294,18 @@ FastCGIServer::process(int timeout_ms)
         int read_socket = it->first;
 
         if (FD_ISSET(read_socket, &fs_read)) {
+#ifdef WIN32
+            int read_result = recv(read_socket, buffer, sizeof(buffer), 0);
+#else
             int read_result = read(read_socket, buffer, sizeof(buffer));
+#endif
             if (read_result == -1)
+            {
                 if (errno == ECONNRESET)
                     goto close_socket;
                 else
                     throw std::runtime_error("read() on socket failed");
+            }
             if (read_result == 0)
                 it->second->close_socket = true;
             else {
@@ -284,9 +317,16 @@ FastCGIServer::process(int timeout_ms)
         if (!it->second->output_buffer.empty() &&
                 FD_ISSET(read_socket, &fs_write)) {
             process_connection_write(*it->second);
+#ifdef WIN32
+            int write_result = send(read_socket,
+                it->second->output_buffer.data(),
+                it->second->output_buffer.size(),
+                0);
+#else
             int write_result = write(read_socket,
                 it->second->output_buffer.data(),
                 it->second->output_buffer.size());
+#endif
             if (write_result == -1)
                 throw std::runtime_error("write() failed");
             it->second->output_buffer.erase(0, write_result);
@@ -294,7 +334,11 @@ FastCGIServer::process(int timeout_ms)
 
         if (it->second->close_socket && it->second->output_buffer.empty()) {
         close_socket:
+#ifdef WIN32
+            int close_result = closesocket(it->first);
+#else
             int close_result = close(it->first);
+#endif
             if (close_result == -1 && errno != ECONNRESET)
                 throw std::runtime_error("close() failed");
             Connection* connection = it->second;
@@ -373,7 +417,7 @@ FastCGIServer::process_connection_read(Connection& connection)
             unsigned role = (body.roleB1 << 8) + body.roleB0;
             if (role != FCGI_RESPONDER) {
                 FCGI_EndRequestRecord unknown;
-                bzero(&unknown, sizeof(unknown));
+                memset(&unknown, 0, sizeof(unknown));
                 unknown.header.version = FCGI_VERSION_1;
                 unknown.header.type = FCGI_END_REQUEST;
                 unknown.header.contentLengthB0 = sizeof(unknown.body);
@@ -409,7 +453,7 @@ FastCGIServer::process_connection_read(Connection& connection)
                 break;
 
             FCGI_EndRequestRecord aborted;
-            bzero(&aborted, sizeof(aborted));
+            memset(&aborted, 0, sizeof(aborted));
             aborted.header.version = FCGI_VERSION_1;
             aborted.header.type = FCGI_END_REQUEST;
             aborted.header.contentLengthB0 = sizeof(aborted.body);
@@ -431,6 +475,7 @@ FastCGIServer::process_connection_read(Connection& connection)
 
             RequestInfo& request = *it->second;
             if (!request.params_closed)
+            {
                 if (content_length != 0)
                     request.params_buffer.append(content, content_length);
                 else {
@@ -447,6 +492,7 @@ FastCGIServer::process_connection_read(Connection& connection)
                     }
                     process_write_request(connection, request_id, request);
                 }
+            }
             break;
         }
         case FCGI_STDIN: {
@@ -456,6 +502,7 @@ FastCGIServer::process_connection_read(Connection& connection)
 
             RequestInfo& request = *it->second;
             if (!request.in_closed)
+            {
                 if (content_length != 0) {
                     request.in.append(content, content_length);
                     if (request.params_closed && request.status == 0) {
@@ -469,13 +516,14 @@ FastCGIServer::process_connection_read(Connection& connection)
                         process_write_request(connection, request_id, request);
                     }
                 }
+            }
             break;
         }
         case FCGI_DATA:
             break;
         default: {
             FCGI_UnknownTypeRecord unknown;
-            bzero(&unknown, sizeof(unknown));
+            memset(&unknown, 0, sizeof(unknown));
             unknown.header.version = FCGI_VERSION_1;
             unknown.header.type = FCGI_UNKNOWN_TYPE;
             unknown.header.contentLengthB0 = sizeof(unknown.body);
@@ -510,7 +558,7 @@ FastCGIServer::process_write_request(Connection& connection, RequestID id,
         write_data(connection.output_buffer, id, request.err, FCGI_STDERR);
 
         FCGI_EndRequestRecord complete;
-        bzero(&complete, sizeof(complete));
+        memset(&complete, 0, sizeof(complete));
         complete.header.version = FCGI_VERSION_1;
         complete.header.type = FCGI_END_REQUEST;
         complete.header.requestIdB1 = (id >> 8) & 0xff;
@@ -623,14 +671,14 @@ FastCGIServer::write_data(std::string& buffer, RequestID id,
                           const std::string& input, unsigned char type)
 {
     FCGI_Header header;
-    bzero(&header, sizeof(header));
+    memset(&header, 0, sizeof(header));
     header.version = FCGI_VERSION_1;
     header.type = type;
     header.requestIdB1 = (id >> 8) & 0xff;
     header.requestIdB0 = id & 0xff;
 
     for (std::string::size_type n = 0;;) {
-        std::string::size_type written = std::min(input.size() - n,
+        std::string::size_type written = min(input.size() - n,
             (std::string::size_type)0xffffu);
 
         header.contentLengthB1 = written >> 8;
